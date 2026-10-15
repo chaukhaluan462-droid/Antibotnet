@@ -4,24 +4,36 @@ import csv
 import io
 import hmac
 import ctypes
+from ctypes import wintypes
 import hashlib
 import json
 import subprocess
 import threading
 import urllib.request
 import urllib.error
+import webbrowser
 import winreg
 from datetime import datetime, timedelta
 from collections import defaultdict
 import psutil
 import customtkinter as ctk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 # Cấu hình chủ đề Dark Mode
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-# Bảng màu Cyberpunk Dark Obsidian v6.1
+# ================= THÔNG TIN PHIÊN BẢN, UPDATE & MẠNG XÃ HỘI =================
+APP_VERSION = "6.3"
+
+DISCORD_PROFILE_URL = "https://discord.com/users/1322107321354289157"
+DISCORD_USER_ID = "1322107321354289157"
+FACEBOOK_PROFILE_URL = "https://www.facebook.com/profile.php?id=61576441887198"
+FACEBOOK_PROFILE_ID = "61576441887198"
+
+UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/your-username/antibotnet-update/main/version.json"
+
+# Bảng màu Cyberpunk Dark Obsidian
 BG_MAIN = "#0b0f19"
 BG_CARD = "#111827"
 BORDER_COLOR = "#1f2937"
@@ -37,7 +49,6 @@ CONFIG_FILE = "antibotnet_config.json"
 # Khóa bí mật dùng để ký License Key (TUYỆT ĐỐI KHÔNG CHIA SẺ MÃ NÀY CHO KHÁCH)
 LICENSE_SECRET_SALT = "ANTIBOTNET_PRO_V6_COMMERCIAL_SECRET_2026_!@#"
 
-# Các thư mục cực kỳ nhạy cảm (Mức độ nghi vấn cao)
 HIGH_RISK_PATHS = [
     "appdata\\local\\temp",
     "windows\\temp",
@@ -46,7 +57,6 @@ HIGH_RISK_PATHS = [
     "$recycle.bin"
 ]
 
-# Các thư mục hợp lệ phổ biến để tránh Cảnh báo nhầm (False Positive)
 LEGIT_INSTALL_PREFIXES = [
     "c:\\program files\\",
     "c:\\program files (x86)\\",
@@ -94,6 +104,153 @@ WHITELIST_PROCESSES = {
 }
 
 
+# ================= BỘ XỬ LÝ KÉO & THẢ FILE NATIVE WINDOWS (KHÔNG CẦN THƯ VIỆN NGOÀI) =================
+WM_DROPFILES = 0x0233
+GWL_WNDPROC = -4
+
+WNDPROC_TYPE = ctypes.WINFUNCTYPE(
+    ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+)
+
+user32 = ctypes.windll.user32
+shell32 = ctypes.windll.shell32
+
+SetWindowLongPtrW = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, WNDPROC_TYPE]
+SetWindowLongPtrW.restype = ctypes.c_void_p
+
+CallWindowProcW = user32.CallWindowProcW
+CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+CallWindowProcW.restype = ctypes.c_ssize_t
+
+shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
+shell32.DragQueryFileW.restype = wintypes.UINT
+shell32.DragFinish.argtypes = [wintypes.HANDLE]
+
+
+def enable_native_file_drop(tk_widget, on_drop_callback):
+    """
+    Kích hoạt tính năng kéo thả file từ Windows Explorer thẳng vào cửa sổ Tkinter/CustomTkinter.
+    Đồng thời mở khóa bộ lọc UIPI (ChangeWindowMessageFilterEx) để kéo thả hoạt động cả khi chạy quyền Admin!
+    """
+    tk_widget.update_idletasks()
+    hwnd = tk_widget.winfo_id()
+
+    # Cho phép nhận sự kiện kéo thả từ Explorer (User thường) sang App đang chạy quyền Administrator
+    try:
+        MSGFLT_ALLOW = 1
+        WM_COPYGLOBALDATA = 0x0049
+        user32.ChangeWindowMessageFilterEx(hwnd, WM_DROPFILES, MSGFLT_ALLOW, None)
+        user32.ChangeWindowMessageFilterEx(hwnd, WM_COPYGLOBALDATA, MSGFLT_ALLOW, None)
+    except Exception:
+        pass
+
+    shell32.DragAcceptFiles(hwnd, True)
+
+    def _wnd_proc(hWnd, msg, wParam, lParam):
+        if msg == WM_DROPFILES:
+            hDrop = wParam
+            count = shell32.DragQueryFileW(hDrop, 0xFFFFFFFF, None, 0)
+            dropped_files = []
+            for i in range(count):
+                length = shell32.DragQueryFileW(hDrop, i, None, 0) + 1
+                buf = ctypes.create_unicode_buffer(length)
+                shell32.DragQueryFileW(hDrop, i, buf, length)
+                dropped_files.append(buf.value)
+            shell32.DragFinish(hDrop)
+            if dropped_files:
+                tk_widget.after(10, lambda: on_drop_callback(dropped_files))
+            return 0
+        return CallWindowProcW(old_proc, hWnd, msg, wParam, lParam)
+
+    new_proc = WNDPROC_TYPE(_wnd_proc)
+    old_proc = SetWindowLongPtrW(hwnd, GWL_WNDPROC, new_proc)
+    # Giữ tham chiếu không bị Garbage Collector xóa
+    tk_widget._native_drop_proc_ref = new_proc
+    tk_widget._native_old_proc_ref = old_proc
+
+
+# ================= MỞ PROFILE DISCORD & FACEBOOK =================
+def show_social_profile_popup(parent, platform: str):
+    is_discord = (platform.lower() == "discord")
+    url = DISCORD_PROFILE_URL if is_discord else FACEBOOK_PROFILE_URL
+    app_protocol = f"discord://-/users/{DISCORD_USER_ID}" if is_discord else url
+
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
+
+    pop = ctk.CTkToplevel(parent)
+    pop.title(f"{'💬 Hồ Sơ Discord' if is_discord else '📘 Hồ Sơ Facebook'} - Nhà Phát Triển")
+    pop.geometry("480x270")
+    pop.resizable(False, False)
+    pop.configure(fg_color=BG_MAIN)
+    pop.lift()
+    pop.focus_force()
+    pop.attributes("-topmost", True)
+    pop.after(250, lambda: pop.attributes("-topmost", False))
+
+    accent = "#5865F2" if is_discord else "#1877F2"
+    title_text = "💬 PROFILE DISCORD CHÍNH THỨC" if is_discord else "📘 PROFILE FACEBOOK CHÍNH THỨC"
+    sub_id = f"Discord User ID: {DISCORD_USER_ID}" if is_discord else f"Facebook UID: {FACEBOOK_PROFILE_ID}"
+
+    card = ctk.CTkFrame(pop, fg_color=BG_CARD, corner_radius=12, border_width=1, border_color=accent)
+    card.pack(fill="both", expand=True, padx=16, pady=16)
+
+    ctk.CTkLabel(
+        card, text=title_text,
+        font=ctk.CTkFont(size=16, weight="bold"), text_color=accent
+    ).pack(pady=(16, 4))
+
+    ctk.CTkLabel(
+        card, text=sub_id,
+        font=ctk.CTkFont(family="Consolas", size=13, weight="bold"), text_color="#fde047"
+    ).pack(pady=(0, 8))
+
+    link_box = ctk.CTkEntry(
+        card, height=34, corner_radius=8, font=("Consolas", 12),
+        fg_color="#090d16", border_color="#334155", text_color="#38bdf8"
+    )
+    link_box.pack(fill="x", padx=20, pady=6)
+    link_box.insert(0, url)
+    link_box.configure(state="readonly")
+
+    status_lbl = ctk.CTkLabel(
+        card, text="✅ Đã tự động mở trang cá nhân trên trình duyệt của bạn!",
+        font=ctk.CTkFont(size=11), text_color="#34d399"
+    )
+    status_lbl.pack(pady=4)
+
+    btn_row = ctk.CTkFrame(card, fg_color="transparent")
+    btn_row.pack(fill="x", padx=20, pady=(8, 12))
+
+    def copy_link():
+        pop.clipboard_clear()
+        pop.clipboard_append(url)
+        status_lbl.configure(text="📋 Đã sao chép đường dẫn Profile vào bộ nhớ tạm!", text_color="#fde047")
+
+    ctk.CTkButton(
+        btn_row, text="🌐 Mở Lại Profile", height=34,
+        fg_color=accent, hover_color="#4752C4" if is_discord else "#166fe5",
+        font=ctk.CTkFont(weight="bold"),
+        command=lambda: webbrowser.open(app_protocol if is_discord else url)
+    ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+    ctk.CTkButton(
+        btn_row, text="📋 Copy Link", width=110, height=34,
+        fg_color="#1e293b", hover_color="#334155", font=ctk.CTkFont(weight="bold"),
+        command=copy_link
+    ).pack(side="left", padx=(0, 6))
+
+    ctk.CTkButton(
+        btn_row, text="Đóng", width=70, height=34,
+        fg_color="#334155", hover_color="#475569",
+        command=pop.destroy
+    ).pack(side="right")
+
+
 # ================= QUYỀN ADMIN & UAC AUTO-ELEVATION =================
 def is_admin() -> bool:
     try:
@@ -103,7 +260,6 @@ def is_admin() -> bool:
 
 
 def ensure_admin_privileges():
-    """Tự động bật bảng UAC xin quyền Administrator khi mở app nếu chưa có."""
     if not is_admin():
         try:
             script = os.path.abspath(sys.argv[0])
@@ -141,9 +297,6 @@ def get_machine_hwid() -> str:
     return f"{digest[0:4]}-{digest[4:8]}-{digest[8:12]}-{digest[12:16]}"
 
 
-# ---- Định dạng key mới (KHÔNG gắn HWID): PRO6-<THỜI HẠN>-<MÃ NGẪU NHIÊN>-<CHỮ KÝ>
-#      VD: PRO6-D030-A1B2C3D4-9F8E7D6C5B4A   (D030 = 30 ngày tính từ ngày kích hoạt)
-#          PRO6-LIFETIME-A1B2C3D4-9F8E7D6C5B4A
 LICENSE_REG_PATH = r"Software\AntiBotnetPro"
 LICENSE_REG_VALUE = "LicenseState"
 
@@ -155,7 +308,6 @@ def _mac(text: str) -> str:
 
 
 def parse_license_key(license_key: str):
-    """Kiểm tra chữ ký key. Trả về (ok, msg, duration_days, clean_key). duration_days = 0 -> vĩnh viễn."""
     clean = (license_key or "").strip().upper()
     if not clean:
         return False, "Chưa nhập mã bản quyền.", 0, ""
@@ -175,7 +327,6 @@ def parse_license_key(license_key: str):
 
 
 def _state_sig(hwid: str, payload: dict) -> str:
-    # Chữ ký gắn với HWID máy -> copy file/registry sang máy khác sẽ mất hiệu lực
     return _mac(hwid.strip().upper() + "|" + json.dumps(payload, sort_keys=True))
 
 
@@ -199,7 +350,6 @@ def _write_state_registry(state: dict):
 
 
 def load_license_state(hwid: str):
-    """Đọc trạng thái bản quyền từ registry + file config, chỉ nhận bản có chữ ký đúng máy này."""
     candidates = [_read_state_registry(), load_config().get("license_state")]
     valid = []
     for st in candidates:
@@ -209,7 +359,6 @@ def load_license_state(hwid: str):
             valid.append(st)
     if not valid:
         return None
-    # Chọn bản "mới nhất" (nhiều key đã dùng nhất, last_seen lớn nhất)
     valid.sort(key=lambda s: (len(s["payload"].get("used_keys", [])), s["payload"].get("last_seen", "")))
     return valid[-1]
 
@@ -221,7 +370,6 @@ def save_license_state(hwid: str, payload: dict):
 
 
 def check_license_state(hwid: str):
-    """Kiểm tra bản quyền đang lưu trên máy. Trả về (ok, msg, hiển thị hạn)."""
     st = load_license_state(hwid)
     if not st:
         return False, "Máy này chưa kích hoạt bản quyền.", ""
@@ -243,7 +391,7 @@ def check_license_state(hwid: str):
     if today > exp_date:
         return False, f"Key đã hết hạn vào ngày {exp_date.strftime('%d/%m/%Y')}. Hãy nhập key mới.", ""
 
-    if today > last_seen:  # cập nhật mốc thời gian đã thấy (chống chỉnh lùi giờ)
+    if today > last_seen:
         p["last_seen"] = today.strftime("%Y%m%d")
         save_license_state(hwid, p)
 
@@ -252,7 +400,6 @@ def check_license_state(hwid: str):
 
 
 def activate_license_key(hwid: str, license_key: str):
-    """Kích hoạt key. 1 máy chỉ dùng 1 key tại một thời điểm, chỉ đổi key khi key cũ đã hết hạn."""
     ok, msg, days, clean = parse_license_key(license_key)
     if not ok:
         return False, msg
@@ -306,16 +453,11 @@ def save_config(data: dict):
         pass
 
 
-# ================= PHÂN TÍCH ĐƯỜNG DẪN & CHỐNG GIẢ MẠO (ANTI-BYPASS) =================
+# ================= PHÂN TÍCH ĐƯỜNG DẪN & CẤU TRÚC NHỊ PHÂN FILE =================
 def is_legitimate_windows_core_process(name_lower: str, exe_path: str) -> bool:
-    """
-    Kiểm tra tiến trình có phải là tiến trình lõi của Windows THẬT hay không.
-    Xử lý chuẩn các tiến trình Kernel ảo (Registry, System, Memory Compression) không có file .exe.
-    """
     kernel_pseudo_procs = {"system", "registry", "idle", "memory compression", "secure system", "vmmem"}
 
     if name_lower in kernel_pseudo_procs:
-        # Tiến trình Kernel ảo chỉ hợp lệ khi không có đường dẫn ổ đĩa thật (không chứa dấu '\' hoặc ':')
         if not exe_path or ("\\" not in exe_path and ":" not in exe_path):
             return True
         return False
@@ -359,21 +501,17 @@ def evaluate_process_risk(name: str, exe_path: str, remote_ip: str, remote_port)
     name_lower = (name or "").lower()
     p_low = os.path.normpath(exe_path).lower() if exe_path else ""
 
-    # 1. Phát hiện giả mạo tiến trình hệ thống (svchost.exe, lsass.exe... nằm sai chỗ)
     if name_lower in WINDOWS_CORE_PROCS and exe_path:
         if not is_legitimate_windows_core_process(name_lower, exe_path):
             return True, True, "🚨 GIẢ MẠO HỆ THỐNG"
 
-    # 2. Phát hiện giả mạo trình duyệt / ứng dụng phổ biến chạy từ thư mục Temp/Public
     if name_lower in WHITELIST_PROCESSES and exe_path:
         if any(hr in p_low for hr in HIGH_RISK_PATHS):
             return True, True, "🚨 GIẢ MẠO APP"
 
-    # 3. Kết nối tới cổng Botnet / RAT C2 đã biết
     if isinstance(remote_port, int) and remote_port in BOTNET_PORTS:
         return True, True, f"🚨 CỔNG C2 ({remote_port})"
 
-    # Nếu là app hợp lệ nằm trong thư mục chuẩn thì an toàn
     if is_legitimate_whitelisted_app(name_lower, exe_path):
         return False, False, "✅ An toàn"
     if any(p_low.startswith(prefix) for prefix in LEGIT_INSTALL_PREFIXES):
@@ -381,17 +519,38 @@ def evaluate_process_risk(name: str, exe_path: str, remote_ip: str, remote_port)
     if any(kw in p_low for kw in LEGIT_APPDATA_KEYWORDS):
         return False, False, "✅ Hợp lệ"
 
-    # 4. Chạy trực tiếp từ thư mục Temp / Users\Public / Recycle.Bin
     if any(hr in p_low for hr in HIGH_RISK_PATHS):
         return True, False, "⚠️ CHẠY TỪ TEMP/PUBLIC"
 
-    # 5. File thực thi trong AppData\Roaming hoặc ProgramData kết nối cổng lạ
     has_external_conn = not remote_ip.startswith("---") and not remote_ip.startswith("0.0.0.0")
     if has_external_conn and isinstance(remote_port, int):
         if ("appdata\\roaming" in p_low or "programdata" in p_low) and remote_port not in STANDARD_SAFE_PORTS:
             return True, False, f"⚠️ KẾT NỐI LẠ (:{remote_port})"
 
     return False, False, "✅ Hoạt động" if has_external_conn else "🟦 Đang chạy (Local)"
+
+
+def inspect_file_static_indicators(filepath: str) -> list:
+    """Quét cấu trúc byte bên trong file để tìm dấu hiệu nén Packer (UPX/VMProtect) hoặc lệnh độc hại"""
+    indicators = []
+    try:
+        with open(filepath, "rb") as f:
+            raw = f.read(4 * 1024 * 1024)  # Đọc 4MB đầu tiên để phân tích nhanh
+        raw_lower = raw.lower()
+
+        if b"upx0" in raw_lower or b"upx1" in raw_lower:
+            indicators.append("Phát hiện nén thực thi UPX Packer (Thường dùng để giấu mã độc)")
+        if b"vmprotect" in raw_lower or b".vmp0" in raw_lower:
+            indicators.append("Phát hiện mã hóa VMProtect")
+        if b"powershell" in raw_lower and (b"-enc" in raw_lower or b"hidden" in raw_lower or b"downloadstring" in raw_lower):
+            indicators.append("Chứa lệnh PowerShell chạy ẩn / tải mã từ xa (Dropper)")
+        if b"virtualalloc" in raw_lower and b"writeprocessmemory" in raw_lower and b"createremotethread" in raw_lower:
+            indicators.append("Chứa bộ API tiêm mã độc vào tiến trình khác (Process Injection)")
+        if b" AsyncRAT" in raw or b"QuasarRAT" in raw or b"njRAT" in raw or b"Remcos" in raw:
+            indicators.append("Chứa chuỗi định danh của công cụ điều khiển từ xa (RAT/Botnet)")
+    except Exception:
+        pass
+    return indicators
 
 
 def get_file_sha256_and_md5(filepath: str):
@@ -422,6 +581,13 @@ def find_defender_scanner() -> str:
     return default_path if os.path.exists(default_path) else ""
 
 
+def version_tuple(v_str: str):
+    try:
+        return tuple(int(x) for x in str(v_str).strip().lstrip("vV").split("."))
+    except Exception:
+        return (0, 0)
+
+
 # ================= ỨNG DỤNG CHÍNH =================
 class AntiBotnetApp(ctk.CTk):
     def __init__(self, hwid: str, license_info: str):
@@ -434,10 +600,11 @@ class AntiBotnetApp(ctk.CTk):
 
         cfg = load_config()
         self.vt_api_key = cfg.get("vt_api_key", "")
+        self.custom_update_url = cfg.get("update_manifest_url", UPDATE_MANIFEST_URL)
 
-        self.title("🛡️ Anti-Botnet & C2 Hunter PRO v6.1 (Commercial Anti-Masquerading & Deep Shield)")
-        self.geometry("1280x800")
-        self.minsize(1120, 700)
+        self.title(f"🛡️ Anti-Botnet & C2 Hunter PRO v{APP_VERSION} (Commercial Edition)")
+        self.geometry("1300x800")
+        self.minsize(1160, 700)
         self.configure(fg_color=BG_MAIN)
 
         self._setup_styles()
@@ -446,8 +613,13 @@ class AntiBotnetApp(ctk.CTk):
         self.bind("<Escape>", lambda e: self.clear_all_selections())
         self.bind("<Control-a>", lambda e: self.select_all_current_tab())
 
-        # Đợi cửa sổ vào mainloop 150ms rồi mới quét để đảm bảo UI luôn hiển thị 100%
+        # Cho phép kéo thả file thẳng vào cửa sổ chính để mở trình quét Virus ngay lập tức
+        self.after(200, lambda: enable_native_file_drop(self, self._on_main_window_file_drop))
         self.after(150, self._run_initial_scans)
+
+    def _on_main_window_file_drop(self, file_list):
+        if file_list and os.path.isfile(file_list[0]):
+            self.open_file_virus_scanner_window(initial_file=file_list[0])
 
     def _run_initial_scans(self):
         self.scan_network()
@@ -494,18 +666,18 @@ class AntiBotnetApp(ctk.CTk):
         header_frame.pack(fill="x", padx=18, pady=(14, 8))
 
         title_box = ctk.CTkFrame(header_frame, fg_color="transparent")
-        title_box.pack(side="left", padx=18, pady=10)
+        title_box.pack(side="left", padx=16, pady=10)
 
         ctk.CTkLabel(
             title_box,
             text="🛡️ ANTI-BOTNET & C2 HUNTER",
-            font=ctk.CTkFont(family="Segoe UI", size=20, weight="bold"),
+            font=ctk.CTkFont(family="Segoe UI", size=19, weight="bold"),
             text_color="#f8fafc"
         ).pack(side="left")
 
         ctk.CTkLabel(
             title_box,
-            text=" PRO v6.1 ",
+            text=f" PRO v{APP_VERSION} ",
             font=ctk.CTkFont(size=11, weight="bold"),
             fg_color="#3b82f6",
             text_color="#ffffff",
@@ -522,24 +694,46 @@ class AntiBotnetApp(ctk.CTk):
         ).pack(side="left", padx=4)
 
         ctk.CTkButton(
-            header_frame, text="🧹 Flush DNS", width=110, height=30,
+            header_frame, text="🧹 Flush DNS", width=98, height=30,
             fg_color="#1e293b", hover_color="#334155", corner_radius=8,
+            font=ctk.CTkFont(size=12, weight="bold"),
             command=self.flush_dns_cache
-        ).pack(side="right", padx=(6, 18))
+        ).pack(side="right", padx=(4, 14))
 
-        admin_text = "🟢 Quyền: Administrator (Đầy đủ)" if self.admin_status else "🔴 Quyền: User thường (Hạn chế)"
+        ctk.CTkButton(
+            header_frame, text="⬆️ Cập Nhật", width=102, height=30,
+            fg_color="#059669", hover_color="#047857", corner_radius=8,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=self.open_update_window
+        ).pack(side="right", padx=4)
+
+        ctk.CTkButton(
+            header_frame, text="📘 Facebook", width=98, height=30,
+            fg_color="#1877F2", hover_color="#166fe5", corner_radius=8,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=lambda: show_social_profile_popup(self, "facebook")
+        ).pack(side="right", padx=4)
+
+        ctk.CTkButton(
+            header_frame, text="💬 Discord", width=94, height=30,
+            fg_color="#5865F2", hover_color="#4752C4", corner_radius=8,
+            font=ctk.CTkFont(size=12, weight="bold"),
+            command=lambda: show_social_profile_popup(self, "discord")
+        ).pack(side="right", padx=4)
+
+        admin_text = "🟢 Admin" if self.admin_status else "🔴 User"
         admin_bg = "#064e3b" if self.admin_status else "#450a0a"
         admin_fg = "#34d399" if self.admin_status else "#f87171"
 
         ctk.CTkLabel(
             header_frame,
-            text=f"  {admin_text}  ",
+            text=f" {admin_text} ",
             text_color=admin_fg,
             fg_color=admin_bg,
             corner_radius=8,
             height=30,
             font=ctk.CTkFont(size=12, weight="bold")
-        ).pack(side="right", padx=6)
+        ).pack(side="right", padx=4)
 
         # ====== 2. 4 THẺ THỐNG KÊ ======
         cards_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -589,7 +783,7 @@ class AntiBotnetApp(ctk.CTk):
 
         self.selection_status_lbl = ctk.CTkLabel(
             log_header,
-            text=f"🆔 HWID: {self.hwid} | Chống giả mạo svchost.exe & Đa kết nối/PID",
+            text=f"🆔 HWID: {self.hwid} | 💡 Có thể KÉO & THẢ file bất kỳ vào cửa sổ để quét Virus!",
             font=ctk.CTkFont(size=12, weight="bold"),
             text_color="#38bdf8"
         )
@@ -600,7 +794,7 @@ class AntiBotnetApp(ctk.CTk):
             fg_color="#090d16", text_color="#cbd5e1", corner_radius=8
         )
         self.log_box.pack(fill="x", padx=10, pady=(2, 8))
-        self.write_log("Khởi động PRO v6.1! Đã bật lớp chống giả mạo tiến trình hệ thống, hiển thị đa kết nối/PID và quét sâu Task Scheduler.")
+        self.write_log(f"Khởi động PRO v{APP_VERSION}! Bấm '🦠 Quét File Bất Kỳ' (hoặc kéo thả file vào app) để kiểm tra virus.")
 
     def _create_stat_card(self, parent, col, title, default_val, color):
         card = ctk.CTkFrame(
@@ -619,6 +813,529 @@ class AntiBotnetApp(ctk.CTk):
         )
         val_lbl.pack(anchor="w", padx=14, pady=(0, 8))
         return val_lbl
+
+    # ================= CỬA SỔ QUÉT VIRUS CHO FILE BẤT KỲ (KÉO THẢ + CHỌN FILE) =================
+    def open_file_virus_scanner_window(self, initial_file: str = ""):
+        win = ctk.CTkToplevel(self)
+        win.title("🦠 Trình Quét Virus File Bất Kỳ (Hỗ trợ Kéo & Thả File hoặc Chọn File)")
+        win.geometry("840x680")
+        win.minsize(740, 560)
+        win.configure(fg_color=BG_MAIN)
+        win.resizable(True, True)
+
+        win.lift()
+        win.focus_force()
+        win.attributes("-topmost", True)
+        win.after(250, lambda: win.attributes("-topmost", False))
+
+        self._current_scanned_file = initial_file
+
+        # Khu vực Kéo & Thả (Drop Zone) + Nút Chọn File
+        drop_frame = ctk.CTkFrame(
+            win, fg_color="#0f172a", corner_radius=12,
+            border_width=2, border_color="#8b5cf6"
+        )
+        drop_frame.pack(fill="x", padx=14, pady=(14, 8))
+
+        ctk.CTkLabel(
+            drop_frame,
+            text="📥 KÉO & THẢ FILE BẤT KỲ VÀO CỬA SỔ NÀY ĐỂ QUÉT VIRUS",
+            font=ctk.CTkFont(size=16, weight="bold"), text_color="#c084fc"
+        ).pack(pady=(12, 2))
+
+        file_lbl = ctk.CTkLabel(
+            drop_frame,
+            text=initial_file if initial_file else "Hoặc bấm nút '📂 Chọn File Từ Máy Tính' bên dưới (Hỗ trợ .exe, .dll, .bat, .vbs, .ps1, .zip...)",
+            font=ctk.CTkFont(family="Consolas", size=12), text_color="#38bdf8"
+        )
+        file_lbl.pack(pady=(0, 8))
+
+        pick_row = ctk.CTkFrame(drop_frame, fg_color="transparent")
+        pick_row.pack(pady=(0, 12))
+
+        def browse_file():
+            chosen = filedialog.askopenfilename(
+                parent=win,
+                title="Chọn File Cần Quét Virus / Mã Độc",
+                filetypes=[("Tất cả các tệp", "*.*"), ("Thực thi & Script", "*.exe;*.dll;*.bat;*.cmd;*.vbs;*.ps1;*.scr;*.msi")]
+            )
+            if chosen and os.path.isfile(chosen):
+                start_scan_for_file(chosen)
+
+        ctk.CTkButton(
+            pick_row, text="📂 Chọn File Từ Máy Tính...", width=210, height=34,
+            fg_color="#7c3aed", hover_color="#6d28d9", font=ctk.CTkFont(weight="bold"),
+            command=browse_file
+        ).pack(side="left", padx=6)
+
+        ctk.CTkButton(
+            pick_row, text="🔄 Quét Lại File Này", width=160, height=34,
+            fg_color="#2563eb", hover_color="#1d4ed8", font=ctk.CTkFont(weight="bold"),
+            command=lambda: start_scan_for_file(self._current_scanned_file) if self._current_scanned_file else browse_file()
+        ).pack(side="left", padx=6)
+
+        # Thanh cấu hình VirusTotal API Key
+        api_frame = ctk.CTkFrame(win, fg_color=BG_CARD, corner_radius=10, border_width=1, border_color=BORDER_COLOR)
+        api_frame.pack(fill="x", padx=14, pady=4)
+
+        ctk.CTkLabel(
+            api_frame, text="🔑 VirusTotal API Key (Tùy chọn):",
+            font=ctk.CTkFont(size=12, weight="bold"), text_color="#94a3b8"
+        ).pack(side="left", padx=12, pady=8)
+
+        api_entry = ctk.CTkEntry(
+            api_frame, width=390, height=30,
+            placeholder_text="Không bắt buộc (Đã có sẵn Windows Defender + Cloud Hash + Static Heuristics)...",
+            fg_color="#090d16", border_color="#334155"
+        )
+        api_entry.pack(side="left", padx=6, pady=8)
+        if self.vt_api_key:
+            api_entry.insert(0, self.vt_api_key)
+
+        def save_key_and_rescan():
+            self.vt_api_key = api_entry.get().strip()
+            save_config({"vt_api_key": self.vt_api_key})
+            if self._current_scanned_file:
+                start_scan_for_file(self._current_scanned_file)
+
+        ctk.CTkButton(
+            api_frame, text="💾 Lưu Key", width=110, height=30,
+            fg_color="#1e293b", hover_color="#334155", font=ctk.CTkFont(weight="bold"),
+            command=save_key_and_rescan
+        ).pack(side="right", padx=12, pady=8)
+
+        # Khung hiển thị kết quả quét
+        report_box = ctk.CTkTextbox(
+            win, font=("Consolas", 12), fg_color="#090d16",
+            text_color="#e2e8f0", corner_radius=10, border_width=1, border_color=BORDER_COLOR
+        )
+        report_box.pack(fill="both", expand=True, padx=14, pady=8)
+        report_box.insert(
+            "end",
+            "💡 Sẵn sàng! Hãy KÉO & THẢ một file từ máy tính vào cửa sổ này hoặc bấm '📂 Chọn File Từ Máy Tính' để bắt đầu quét.\n"
+        )
+
+        # Cụm nút hành động xử lý file sau khi quét
+        action_bar = ctk.CTkFrame(win, fg_color="transparent")
+        action_bar.pack(fill="x", padx=14, pady=(0, 12))
+
+        def block_file_in_firewall():
+            fpath = self._current_scanned_file
+            if not fpath or not os.path.exists(fpath):
+                messagebox.showwarning("Chưa có file", "Hãy chọn hoặc kéo thả 1 file vào để quét trước!")
+                return
+            fname = os.path.basename(fpath)
+            rule_name = f"AntiBotnet_App_{fname}"
+            res = subprocess.run(
+                f'netsh advfirewall firewall add rule name="{rule_name}" dir=out action=block program="{fpath}"',
+                shell=True, capture_output=True
+            )
+            if res.returncode == 0:
+                self.write_log(f"[🛡️] Đã khóa mạng vĩnh viễn cho file: {fpath}")
+                self.scan_firewall_rules()
+                messagebox.showinfo("Đã khóa mạng", f"Đã chặn tuyệt đối file '{fname}' kết nối Internet trên Windows Firewall!")
+            else:
+                messagebox.showerror("Lỗi", "Không thể thêm quy tắc Firewall (Cần quyền Admin).")
+
+        def delete_scanned_file():
+            fpath = self._current_scanned_file
+            if not fpath or not os.path.exists(fpath):
+                messagebox.showwarning("Chưa có file", "Hãy chọn hoặc kéo thả 1 file vào trước!")
+                return
+            if messagebox.askyesno("🗑️ Xác nhận xóa vĩnh viễn", f"Bạn có chắc chắn muốn XÓA VĨNH VIỄN tệp tin này khỏi máy tính?\n\n{fpath}"):
+                try:
+                    # Nếu file đang chạy thì kill trước khi xóa
+                    for proc in psutil.process_iter(["pid", "exe"]):
+                        try:
+                            if proc.info["exe"] and os.path.normcase(proc.info["exe"]) == os.path.normcase(fpath):
+                                proc.kill()
+                        except Exception:
+                            pass
+                    os.remove(fpath)
+                    self.write_log(f"[🗑️] Đã tiêu hủy tệp tin nghi vấn: {fpath}")
+                    append_rep(f"\n[🗑️] ĐÃ XÓA VĨNH VIỄN TỆP TIN KHỎI Ổ ĐĨA: {fpath}")
+                    messagebox.showinfo("Đã xóa", "Đã xóa vĩnh viễn tệp tin thành công!")
+                except Exception as e:
+                    messagebox.showerror("Lỗi khi xóa", f"Không thể xóa file: {e}")
+
+        ctk.CTkButton(
+            action_bar, text="🧱 Khóa File Này Truy Cập Mạng (Firewall)", width=270, height=36,
+            fg_color="#d97706", hover_color="#b45309", font=ctk.CTkFont(weight="bold"),
+            command=block_file_in_firewall
+        ).pack(side="left", padx=4)
+
+        ctk.CTkButton(
+            action_bar, text="🗑️ Xóa Vĩnh Viễn File Này", width=200, height=36,
+            fg_color="#dc2626", hover_color="#b91c1c", font=ctk.CTkFont(weight="bold"),
+            command=delete_scanned_file
+        ).pack(side="left", padx=4)
+
+        ctk.CTkButton(
+            action_bar, text="Đóng Cửa Sổ", width=115, height=36,
+            fg_color="#334155", hover_color="#475569",
+            command=win.destroy
+        ).pack(side="right", padx=4)
+
+        def append_rep(text: str):
+            if win.winfo_exists():
+                report_box.insert("end", text + "\n")
+                report_box.see("end")
+
+        def start_scan_for_file(target_path: str):
+            if not target_path or not os.path.isfile(target_path):
+                return
+            self._current_scanned_file = target_path
+            file_lbl.configure(text=f"🎯 Đang chọn: {target_path}", text_color="#fde047")
+            report_box.delete("1.0", "end")
+            append_rep(f"⏳ ĐANG QUÉT CHUYÊN SÂU TỆP TIN: {os.path.basename(target_path)}\n" + "=" * 86)
+
+            def worker():
+                try:
+                    file_size_mb = os.path.getsize(target_path) / (1024 * 1024)
+                    mtime = datetime.fromtimestamp(os.path.getmtime(target_path)).strftime("%Y-%m-%d %H:%M:%S")
+                    sha256_hash, md5_hash = get_file_sha256_and_md5(target_path)
+
+                    sig_cmd = f'powershell -NoProfile -Command "$s = Get-AuthenticodeSignature -FilePath \'{target_path}\'; Write-Output ($s.Status.ToString() + \' | \' + $s.SignerCertificate.Subject)"'
+                    sig_res = subprocess.run(sig_cmd, shell=True, capture_output=True, text=True)
+                    sig_out = sig_res.stdout.strip() or "Unknown"
+                    is_signed_valid = sig_out.startswith("Valid")
+                    sig_display = f"✅ HỢP LỆ ({sig_out})" if is_signed_valid else f"⚠️ KHÔNG CÓ CHỮ KÝ SỐ ({sig_out})"
+
+                    info_block = (
+                        f"\n[1] 📄 THÔNG TIN TỆP TIN & CHỮ KÝ SỐ (AUTHENTICODE):\n"
+                        f"  • Tên tệp tin     : {os.path.basename(target_path)}\n"
+                        f"  • Đường dẫn       : {target_path}\n"
+                        f"  • Dung lượng      : {file_size_mb:.2f} MB  |  Ngày sửa đổi: {mtime}\n"
+                        f"  • Chữ ký số       : {sig_display}\n"
+                        f"  • Mã băm SHA-256  : {sha256_hash}\n"
+                        f"  • Mã băm MD5      : {md5_hash}"
+                    )
+                    self.after(0, lambda: append_rep(info_block))
+
+                    self.after(0, lambda: append_rep("\n[2] 🦠 KẾT QUẢ QUÉT VIRUS & PHÂN TÍCH MÃ ĐỘC 4 LỚP:"))
+
+                    # Lớp 1: Windows Defender Antivirus Engine
+                    mpcmd = find_defender_scanner()
+                    defender_clean = True
+                    if mpcmd:
+                        self.after(0, lambda: append_rep("  • [Lớp 1 - Windows Defender Engine] : ⏳ Đang quét trực tiếp tệp tin..."))
+                        scan_cmd = f'"{mpcmd}" -Scan -ScanType 3 -File "{target_path}" -DisableRemediation'
+                        scan_res = subprocess.run(scan_cmd, shell=True, capture_output=True, text=True)
+                        out_text = (scan_res.stdout + "\n" + scan_res.stderr).strip()
+                        if scan_res.returncode == 0 and "found no threats" in out_text.lower():
+                            self.after(0, lambda: append_rep("    => ✅ SẠCH 100% (Windows Defender xác nhận KHÔNG CÓ VIRUS)."))
+                        elif scan_res.returncode == 2 or "threat" in out_text.lower():
+                            defender_clean = False
+                            self.after(0, lambda: append_rep(f"    => 🚨 PHÁT HIỆN MÃ ĐỘC / VIRUS! Chi tiết: {out_text.splitlines()[-1]}"))
+                        else:
+                            self.after(0, lambda: append_rep("    => ✅ Hoàn tất kiểm tra (Không phát hiện mẫu nhận diện độc hại)."))
+                    else:
+                        self.after(0, lambda: append_rep("  • [Lớp 1 - Windows Defender Engine] : Không tìm thấy MpCmdRun.exe."))
+
+                    # Lớp 2: Cloud Malware Hash DB (Team Cymru)
+                    cymru_detected = False
+                    try:
+                        cymru_cmd = f'nslookup -type=txt {sha256_hash}.malware.hash.cymru.com'
+                        cymru_res = subprocess.run(cymru_cmd, shell=True, capture_output=True, text=True, timeout=5)
+                        cymru_out = cymru_res.stdout.lower()
+                        if '"1' in cymru_out or '"2' in cymru_out:
+                            cymru_detected = True
+                            self.after(0, lambda: append_rep("  • [Lớp 2 - Cloud Malware Hash DB]   : 🚨 CẢNH BÁO ĐỎ! Mã SHA-256 nằm trong danh sách Malware quốc tế!"))
+                        else:
+                            self.after(0, lambda: append_rep("  • [Lớp 2 - Cloud Malware Hash DB]   : ✅ SẠCH (Mã SHA-256 không nằm trong danh sách đen toàn cầu)."))
+                    except Exception:
+                        self.after(0, lambda: append_rep("  • [Lớp 2 - Cloud Malware Hash DB]   : ✅ Không ghi nhận báo cáo độc hại."))
+
+                    # Lớp 3: Quét cấu trúc Byte nhị phân (Packer / Injection / RAT Strings)
+                    static_flags = inspect_file_static_indicators(target_path)
+                    if static_flags:
+                        flags_str = " | ".join(static_flags)
+                        self.after(0, lambda: append_rep(f"  • [Lớp 3 - Phân Tích Cấu Trúc Byte] : ⚠️ PHÁT HIỆN DẤU HIỆU NGHI VẤN ({flags_str})"))
+                    else:
+                        self.after(0, lambda: append_rep("  • [Lớp 3 - Phân Tích Cấu Trúc Byte] : ✅ SẠCH (Không phát hiện nén UPX hay hàm tiêm mã độc)."))
+
+                    # Lớp 4: VirusTotal API v3 (Nếu có API Key)
+                    vt_malicious = 0
+                    if self.vt_api_key:
+                        try:
+                            vt_url = f"https://www.virustotal.com/api/v3/files/{sha256_hash}"
+                            vt_req = urllib.request.Request(vt_url, headers={"x-apikey": self.vt_api_key})
+                            with urllib.request.urlopen(vt_req, timeout=6) as resp:
+                                vt_json = json.loads(resp.read().decode("utf-8"))
+                                stats = vt_json["data"]["attributes"]["last_analysis_stats"]
+                                vt_malicious = stats.get("malicious", 0)
+                                sus = stats.get("suspicious", 0)
+                                total = vt_malicious + sus + stats.get("harmless", 0) + stats.get("undetected", 0)
+                                verdict = f"🚨 NGUY HIỂM ({vt_malicious}/{total} hãng báo độc hại)" if vt_malicious > 0 else f"✅ SẠCH (0/{total} hãng phát hiện)"
+                                self.after(0, lambda: append_rep(f"  • [Lớp 4 - VirusTotal Cloud API]    : {verdict}"))
+                        except urllib.error.HTTPError as he:
+                            if he.code == 404:
+                                self.after(0, lambda: append_rep("  • [Lớp 4 - VirusTotal Cloud API]    : File riêng tư chưa từng bị báo cáo lên VirusTotal."))
+                            else:
+                                self.after(0, lambda: append_rep(f"  • [Lớp 4 - VirusTotal Cloud API]    : Lỗi API Key (HTTP {he.code})."))
+                        except Exception as e:
+                            self.after(0, lambda: append_rep(f"  • [Lớp 4 - VirusTotal Cloud API]    : Lỗi kết nối ({e})."))
+
+                    # Kết luận cuối cùng
+                    if not defender_clean or cymru_detected or vt_malicious > 0:
+                        final_msg = "🔴 KẾT LUẬN: PHÁT HIỆN VIRUS / MÃ ĐỘC! HÃY BẤM 'XÓA VĨNH VIỄN FILE NÀY' BÊN DƯỚI!"
+                    elif static_flags or not is_signed_valid:
+                        final_msg = "🟡 KẾT LUẬN: CHƯA PHÁT HIỆN VIRUS NHƯNG FILE KHÔNG CÓ CHỮ KÝ SỐ / CÓ DẤU HIỆU NÉN (Cẩn thận khi mở)"
+                    else:
+                        final_msg = "🟢 KẾT LUẬN: TỆP TIN AN TOÀN TUYỆT ĐỐI (Chữ ký số hợp lệ & Sạch trên mọi lớp quét)"
+
+                    self.after(0, lambda: append_rep("\n" + "=" * 86 + f"\n{final_msg}"))
+                except Exception as e:
+                    self.after(0, lambda: append_rep(f"\n❌ Lỗi khi quét file: {e}"))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        # Kích hoạt nhận Kéo & Thả File trực tiếp trên cửa sổ quét này
+        win.after(150, lambda: enable_native_file_drop(
+            win,
+            lambda files: start_scan_for_file(files[0]) if files and os.path.isfile(files[0]) else None
+        ))
+
+        if initial_file and os.path.isfile(initial_file):
+            start_scan_for_file(initial_file)
+
+    # ================= CỬA SỔ CẬP NHẬT PHIÊN BẢN MỚI =================
+    def open_update_window(self):
+        win = ctk.CTkToplevel(self)
+        win.title(f"⬆️ Trung Tâm Cập Nhật Trực Tuyến - Anti-Botnet PRO v{APP_VERSION}")
+        win.geometry("680x500")
+        win.resizable(False, False)
+        win.configure(fg_color=BG_MAIN)
+        win.lift()
+        win.focus_force()
+        win.attributes("-topmost", True)
+        win.after(250, lambda: win.attributes("-topmost", False))
+
+        card = ctk.CTkFrame(win, fg_color=BG_CARD, corner_radius=12, border_width=1, border_color=BORDER_COLOR)
+        card.pack(fill="both", expand=True, padx=16, pady=16)
+
+        ctk.CTkLabel(
+            card, text=f"🚀 CẬP NHẬT PHIÊN BẢN MỚI (HIỆN TẠI: v{APP_VERSION})",
+            font=ctk.CTkFont(size=17, weight="bold"), text_color="#38bdf8"
+        ).pack(pady=(14, 4))
+
+        ctk.CTkLabel(
+            card, text="Tự động kiểm tra, tải bản cập nhật mới và khởi động lại ứng dụng (Giữ nguyên Key bản quyền):",
+            font=ctk.CTkFont(size=12), text_color="#94a3b8"
+        ).pack(pady=(0, 10))
+
+        url_frame = ctk.CTkFrame(card, fg_color="#090d16", corner_radius=8)
+        url_frame.pack(fill="x", padx=18, pady=4)
+
+        ctk.CTkLabel(
+            url_frame, text="🔗 Nguồn Update:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#cbd5e1"
+        ).pack(side="left", padx=10, pady=8)
+
+        url_entry = ctk.CTkEntry(
+            url_frame, height=30, font=("Consolas", 11),
+            placeholder_text="Link version.json hoặc link tải trực tiếp file .exe mới...",
+            fg_color="#111827", border_color="#334155"
+        )
+        url_entry.pack(side="left", fill="x", expand=True, padx=6, pady=8)
+        url_entry.insert(0, self.custom_update_url)
+
+        info_box = ctk.CTkTextbox(
+            card, height=195, font=("Consolas", 12),
+            fg_color="#090d16", text_color="#e2e8f0", corner_radius=8, border_width=1, border_color=BORDER_COLOR
+        )
+        info_box.pack(fill="both", expand=True, padx=18, pady=8)
+
+        progress_bar = ctk.CTkProgressBar(card, height=14, corner_radius=6, progress_color="#10b981")
+        progress_bar.pack(fill="x", padx=18, pady=(4, 2))
+        progress_bar.set(0)
+
+        status_lbl = ctk.CTkLabel(
+            card, text="Sẵn sàng kiểm tra bản cập nhật mới.",
+            font=ctk.CTkFont(size=12, weight="bold"), text_color="#34d399"
+        )
+        status_lbl.pack(pady=4)
+
+        btn_frame = ctk.CTkFrame(card, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=18, pady=(6, 14))
+
+        self._latest_download_url = ""
+
+        def log_upd(msg: str):
+            if win.winfo_exists():
+                info_box.insert("end", msg + "\n")
+                info_box.see("end")
+
+        def check_for_updates():
+            target_url = url_entry.get().strip()
+            self.custom_update_url = target_url
+            save_config({"update_manifest_url": target_url})
+
+            info_box.delete("1.0", "end")
+            progress_bar.set(0)
+            log_upd(f"⏳ Đang kết nối máy chủ cập nhật...\nURL: {target_url}\n" + "-" * 68)
+
+            if target_url.lower().endswith((".exe", ".py")):
+                self._latest_download_url = target_url
+                log_upd("✅ Phát hiện đường dẫn tải trực tiếp file thực thi!")
+                log_upd("👉 Bạn có thể bấm nút '⬇️ Tải & Cập Nhật Ngay' bên dưới để nâng cấp.")
+                status_lbl.configure(text="Đã sẵn sàng tải bản cập nhật trực tiếp!", text_color="#fde047")
+                update_btn.configure(state="normal")
+                return
+
+            def worker():
+                try:
+                    req = urllib.request.Request(target_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=6) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+
+                    remote_ver = str(data.get("version", "")).strip()
+                    dl_url = str(data.get("download_url", "")).strip()
+                    changelog = str(data.get("changelog", "Không có ghi chú chi tiết.")).strip()
+
+                    if not remote_ver or not dl_url:
+                        self.after(0, lambda: log_upd("⚠️ File JSON không đúng cấu trúc (Cần có 'version' và 'download_url')."))
+                        return
+
+                    self._latest_download_url = dl_url
+                    if version_tuple(remote_ver) > version_tuple(APP_VERSION):
+                        msg = (
+                            f"🎉 PHÁT HIỆN PHIÊN BẢN MỚI: v{remote_ver} (Phiên bản đang dùng: v{APP_VERSION})\n\n"
+                            f"📋 Điểm mới trong bản v{remote_ver}:\n{changelog}\n\n"
+                            f"🔗 Link tải: {dl_url}\n"
+                            f"👉 Bấm '⬇️ Tải & Cập Nhật Ngay' bên dưới để tự động nâng cấp!"
+                        )
+                        self.after(0, lambda: [
+                            log_upd(msg),
+                            status_lbl.configure(text=f"🔥 Có bản cập nhật mới v{remote_ver}! Bấm nút cập nhật ngay.", text_color="#fde047"),
+                            update_btn.configure(state="normal")
+                        ])
+                    else:
+                        msg = (
+                            f"✅ Bạn đang sử dụng phiên bản mới nhất (v{APP_VERSION})!\n\n"
+                            f"📋 Thông tin bản trên máy chủ (v{remote_ver}):\n{changelog}"
+                        )
+                        self.after(0, lambda: [
+                            log_upd(msg),
+                            status_lbl.configure(text="✅ Phiên bản của bạn đã là bản mới nhất!", text_color="#34d399"),
+                            update_btn.configure(state="normal")
+                        ])
+                except Exception as e:
+                    guide = (
+                        f"⚠️ Chưa kết nối được máy chủ Update ({e}).\n\n"
+                        f"💡 HƯỚNG DẪN:\n"
+                        f"• Bạn có thể dán trực tiếp link tải file .exe mới vào ô 'Nguồn Update' ở trên rồi bấm Cập Nhật.\n"
+                        f"• Hoặc tạo file 'version.json' trên GitHub Raw chứa:\n"
+                        f'  {{"version": "6.4", "download_url": "https://.../AntiBotnet_Pro.exe", "changelog": "Bản mới"}}'
+                    )
+                    self.after(0, lambda: [
+                        log_upd(guide),
+                        status_lbl.configure(text="Có thể dán link tải trực tiếp .exe vào ô trên để cập nhật!", text_color="#f87171")
+                    ])
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        def download_and_apply_update():
+            dl_url = self._latest_download_url or url_entry.get().strip()
+            if not dl_url or not dl_url.startswith("http"):
+                messagebox.showwarning("Chưa có link tải", "Vui lòng kiểm tra bản mới hoặc dán link tải (.exe / .py) vào ô Nguồn Update!")
+                return
+
+            update_btn.configure(state="disabled")
+            status_lbl.configure(text="⏳ Đang tải bản cập nhật mới...", text_color="#38bdf8")
+
+            def dl_worker():
+                try:
+                    is_frozen = getattr(sys, "frozen", False)
+                    current_file = os.path.abspath(sys.executable if is_frozen else sys.argv[0])
+                    current_dir = os.path.dirname(current_file)
+                    ext = ".exe" if is_frozen else ".py"
+                    temp_new_file = os.path.join(current_dir, f"AntiBotnet_Update_New{ext}")
+
+                    req = urllib.request.Request(dl_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=20) as resp:
+                        total_size = int(resp.info().get("Content-Length", 0) or 0)
+                        downloaded = 0
+                        with open(temp_new_file, "wb") as out_f:
+                            while True:
+                                chunk = resp.read(65536)
+                                if not chunk:
+                                    break
+                                out_f.write(chunk)
+                                downloaded += len(chunk)
+                                if total_size > 0:
+                                    pct = min(1.0, downloaded / total_size)
+                                    self.after(0, lambda p=pct: [
+                                        progress_bar.set(p),
+                                        status_lbl.configure(text=f"⏳ Đang tải xuống: {int(p * 100)}%")
+                                    ])
+
+                    self.after(0, lambda: [
+                        progress_bar.set(1.0),
+                        log_upd(f"\n✅ Đã tải xong file cập nhật: {temp_new_file}"),
+                        status_lbl.configure(text="✅ Tải hoàn tất! Đang tự động khởi động lại vào bản mới...", text_color="#34d399")
+                    ])
+
+                    bat_path = os.path.join(current_dir, "antibotnet_updater_run.bat")
+                    if is_frozen:
+                        bat_content = (
+                            "@echo off\n"
+                            "timeout /t 2 /nobreak >nul\n"
+                            f'move /y "{temp_new_file}" "{current_file}" >nul\n'
+                            f'start "" "{current_file}"\n'
+                            'del "%~f0"\n'
+                        )
+                    else:
+                        bat_content = (
+                            "@echo off\n"
+                            "timeout /t 2 /nobreak >nul\n"
+                            f'move /y "{temp_new_file}" "{current_file}" >nul\n'
+                            f'start "" "{sys.executable}" "{current_file}"\n'
+                            'del "%~f0"\n'
+                        )
+
+                    with open(bat_path, "w", encoding="utf-8") as bf:
+                        bf.write(bat_content)
+
+                    def finish_and_restart():
+                        messagebox.showinfo(
+                            "Cập Nhật Thành Công",
+                            "Đã tải xong phiên bản mới!\nỨng dụng sẽ tự động đóng và khởi động lại vào bản mới ngay bây giờ."
+                        )
+                        subprocess.Popen(f'cmd.exe /c "{bat_path}"', shell=True)
+                        self.destroy()
+                        sys.exit(0)
+
+                    self.after(300, finish_and_restart)
+
+                except Exception as e:
+                    self.after(0, lambda: [
+                        log_upd(f"\n❌ Lỗi khi tải bản cập nhật: {e}"),
+                        status_lbl.configure(text=f"❌ Tải thất bại: {e}", text_color="#f43f5e"),
+                        update_btn.configure(state="normal")
+                    ])
+
+            threading.Thread(target=dl_worker, daemon=True).start()
+
+        ctk.CTkButton(
+            btn_frame, text="🔍 Kiểm Tra Bản Mới", width=165, height=36,
+            fg_color="#2563eb", hover_color="#1d4ed8", font=ctk.CTkFont(weight="bold"),
+            command=check_for_updates
+        ).pack(side="left", padx=(0, 8))
+
+        update_btn = ctk.CTkButton(
+            btn_frame, text="⬇️ Tải & Cập Nhật Tự Động Ngay", height=36,
+            fg_color="#059669", hover_color="#047857", font=ctk.CTkFont(weight="bold"),
+            command=download_and_apply_update
+        )
+        update_btn.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        ctk.CTkButton(
+            btn_frame, text="Đóng", width=85, height=36,
+            fg_color="#334155", hover_color="#475569",
+            command=win.destroy
+        ).pack(side="right")
+
+        check_for_updates()
 
     # ================= TAB 1: GIÁM SÁT MẠNG & TOÀN BỘ APP =================
     def _build_network_tab(self):
@@ -708,35 +1425,36 @@ class AntiBotnetApp(ctk.CTk):
         btn_frame.pack(fill="x", pady=(10, 2))
 
         ctk.CTkButton(
-            btn_frame, text="🔄 Quét Lại", width=100, height=36, corner_radius=8,
+            btn_frame, text="🔄 Quét Lại", width=95, height=36, corner_radius=8,
             fg_color="#2563eb", hover_color="#1d4ed8", font=ctk.CTkFont(weight="bold"),
             command=self.scan_network
         ).pack(side="left", padx=3)
 
         ctk.CTkButton(
-            btn_frame, text="🛡️ CHẶN BOTNET", width=155, height=36, corner_radius=8,
+            btn_frame, text="🛡️ CHẶN BOTNET", width=145, height=36, corner_radius=8,
             fg_color="#e11d48", hover_color="#be123c", font=ctk.CTkFont(weight="bold"),
             command=self.block_botnet_action
         ).pack(side="left", padx=3)
 
         ctk.CTkButton(
-            btn_frame, text="💀 Kill Đã Chọn", width=120, height=36, corner_radius=8,
+            btn_frame, text="💀 Kill Đã Chọn", width=115, height=36, corner_radius=8,
             fg_color="#dc2626", hover_color="#b91c1c", font=ctk.CTkFont(weight="bold"),
             command=self.kill_selected_processes
         ).pack(side="left", padx=3)
 
         ctk.CTkButton(
-            btn_frame, text="❄️ Đóng Băng", width=110, height=36, corner_radius=8,
+            btn_frame, text="❄️ Đóng Băng", width=105, height=36, corner_radius=8,
             fg_color="#0284c7", hover_color="#0369a1", font=ctk.CTkFont(weight="bold"),
             command=self.suspend_selected_processes
         ).pack(side="left", padx=3)
 
         ctk.CTkButton(
-            btn_frame, text="🔥 Rã Đông", width=95, height=36, corner_radius=8,
+            btn_frame, text="🔥 Rã Đông", width=90, height=36, corner_radius=8,
             fg_color="#059669", hover_color="#047857", font=ctk.CTkFont(weight="bold"),
             command=self.resume_selected_processes
         ).pack(side="left", padx=3)
 
+        # CỤM NÚT BÊN PHẢI: Mở Vị Trí File + Soi IP & Quét Virus + Quét File Bất Kỳ (Kéo/Thả)
         ctk.CTkButton(
             btn_frame, text="📂 Mở Vị Trí File", width=125, height=36, corner_radius=8,
             fg_color="#334155", hover_color="#475569", font=ctk.CTkFont(weight="bold"),
@@ -744,12 +1462,18 @@ class AntiBotnetApp(ctk.CTk):
         ).pack(side="right", padx=3)
 
         ctk.CTkButton(
-            btn_frame, text="🔍 Soi IP & Quét Virus (In-App)", width=210, height=36, corner_radius=8,
+            btn_frame, text="🔍 Soi IP & Quét Virus (In-App)", width=195, height=36, corner_radius=8,
             fg_color="#0f766e", hover_color="#115e59", font=ctk.CTkFont(weight="bold"),
             command=self.open_inapp_scanner_window
         ).pack(side="right", padx=3)
 
-    # ================= TAB 2: QUÉT SÂU PERSISTENCE (REGISTRY + STARTUP + TASK) =================
+        ctk.CTkButton(
+            btn_frame, text="🦠 Quét File Bất Kỳ (Kéo/Thả)", width=195, height=36, corner_radius=8,
+            fg_color="#7c3aed", hover_color="#6d28d9", font=ctk.CTkFont(weight="bold"),
+            command=self.open_file_virus_scanner_window
+        ).pack(side="right", padx=3)
+
+    # ================= TAB 2: QUÉT SÂU PERSISTENCE =================
     def _build_registry_tab(self):
         top_bar = ctk.CTkFrame(self.tab_reg, fg_color="transparent")
         top_bar.pack(fill="x", pady=(0, 6))
@@ -937,7 +1661,7 @@ class AntiBotnetApp(ctk.CTk):
         count = len(tree.selection())
         if count == 0:
             self.selection_status_lbl.configure(
-                text=f"🆔 HWID: {self.hwid} | Chưa chọn dòng nào",
+                text=f"🆔 HWID: {self.hwid} | 💡 Có thể KÉO & THẢ file bất kỳ vào cửa sổ để quét Virus!",
                 text_color="#94a3b8"
             )
         else:
@@ -973,7 +1697,6 @@ class AntiBotnetApp(ctk.CTk):
 
         self.cached_net_rows.clear()
         sus_total = 0
-        # Lưu danh sách TẤT CẢ các kết nối của mỗi PID (Không bị ghi đè kết nối)
         active_pids_with_net = defaultdict(list)
         seen_conn_per_pid = defaultdict(set)
 
@@ -1011,7 +1734,6 @@ class AntiBotnetApp(ctk.CTk):
                 seen_pids.add(pid)
                 name_lower = name.lower()
 
-                # KIỂM TRA CHỐNG GIẢ MẠO: Chỉ ẩn tiến trình Windows nếu đúng đường dẫn System32/SysWOW64!
                 if is_legitimate_windows_core_process(name_lower, exe_path):
                     continue
 
@@ -1032,7 +1754,6 @@ class AntiBotnetApp(ctk.CTk):
             except Exception:
                 continue
 
-        # Sắp xếp ưu tiên: Nguy hiểm cao -> Nghi vấn -> Có kết nối mạng -> Tên A-Z
         self.cached_net_rows.sort(key=lambda x: (not x[8], not x[7], "STANDBY" in x[4], x[1].lower()))
 
         self.card_conn_val.configure(text=str(len(self.cached_net_rows)))
@@ -1188,11 +1909,11 @@ class AntiBotnetApp(ctk.CTk):
                 f"Đã khóa các cổng C2 ({port_list}) và xử lý {len(sus_rows)} mục nghi vấn!"
             )
 
-    # ================= CỬA SỔ SOI VIRUS IN-APP =================
+    # ================= CỬA SỔ SOI IP & QUÉT VIRUS CHO TIẾN TRÌNH ĐANG CHỌN =================
     def open_inapp_scanner_window(self):
         rows = self.get_selected_net_rows()
         if not rows:
-            messagebox.showwarning("Chưa chọn dòng", "Vui lòng tích chọn 1 dòng trên bảng để Soi IP & Quét Virus!")
+            messagebox.showwarning("Chưa chọn dòng", "Vui lòng tích chọn 1 dòng trên bảng để Soi IP & Quét Virus (Hoặc bấm nút '🦠 Quét File Bất Kỳ' bên cạnh để kéo thả file)!")
             return
 
         first = rows[0]
@@ -1475,7 +2196,7 @@ class AntiBotnetApp(ctk.CTk):
             self.write_log("[🧹] Đã dọn sạch bộ nhớ đệm DNS thành công!")
             messagebox.showinfo("Flush DNS", "Đã làm sạch bộ nhớ đệm DNS của Windows!")
 
-    # ================= QUÉT SÂU PERSISTENCE (REGISTRY + STARTUP FOLDER + TASK SCHEDULER) =================
+    # ================= QUÉT SÂU PERSISTENCE =================
     def scan_registry_and_persistence(self):
         for item in self.reg_tree.get_children():
             self.reg_tree.delete(item)
@@ -1486,7 +2207,6 @@ class AntiBotnetApp(ctk.CTk):
         ]
         row_idx = 0
 
-        # 1. Quét 5 nhánh Registry Run / RunOnce / WOW6432Node
         registry_targets = [
             (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", "REG: HKCU\\Run"),
             (winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\RunOnce", "REG: HKCU\\RunOnce"),
@@ -1516,7 +2236,6 @@ class AntiBotnetApp(ctk.CTk):
             except Exception:
                 pass
 
-        # 2. Quét khóa Winlogon (Shell & Userinit)
         try:
             wl_key = winreg.OpenKey(
                 winreg.HKEY_LOCAL_MACHINE,
@@ -1538,7 +2257,6 @@ class AntiBotnetApp(ctk.CTk):
         except Exception:
             pass
 
-        # 3. Quét 2 thư mục Startup Folder
         startup_dirs = [
             ("FOLDER: User Startup", os.path.expandvars(r"%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup")),
             ("FOLDER: System Startup", r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp")
@@ -1558,7 +2276,6 @@ class AntiBotnetApp(ctk.CTk):
                 except Exception:
                     pass
 
-        # 4. Quét Scheduled Tasks
         try:
             res = subprocess.run('schtasks /query /fo CSV /v /nh', shell=True, capture_output=True, text=True, timeout=6)
             if res.returncode == 0 and res.stdout:
@@ -1677,8 +2394,8 @@ class LicenseActivationWindow(ctk.CTk):
         self.hwid = hwid
         self.activated_successfully = False
 
-        self.title("🔐 Kích Hoạt Bản Quyền - Anti-Botnet PRO v6.1")
-        self.geometry("560x360")
+        self.title(f"🔐 Kích Hoạt Bản Quyền - Anti-Botnet PRO v{APP_VERSION}")
+        self.geometry("580x420")
         self.resizable(False, False)
         self.configure(fg_color=BG_MAIN)
 
@@ -1688,12 +2405,12 @@ class LicenseActivationWindow(ctk.CTk):
         ctk.CTkLabel(
             card, text="🛡️ KÍCH HOẠT BẢN QUYỀN THƯƠNG MẠI",
             font=ctk.CTkFont(size=18, weight="bold"), text_color="#38bdf8"
-        ).pack(pady=(18, 4))
+        ).pack(pady=(16, 4))
 
         ctk.CTkLabel(
             card, text="Nhập License Key do người bán cung cấp để kích hoạt (mỗi máy dùng 1 key cho đến khi hết hạn):",
             font=ctk.CTkFont(size=12), text_color="#94a3b8"
-        ).pack(pady=(0, 12))
+        ).pack(pady=(0, 10))
 
         hwid_frame = ctk.CTkFrame(card, fg_color="#090d16", corner_radius=8)
         hwid_frame.pack(fill="x", padx=28, pady=6)
@@ -1714,7 +2431,7 @@ class LicenseActivationWindow(ctk.CTk):
             height=38, corner_radius=8, font=("Consolas", 13),
             fg_color="#090d16", border_color="#334155"
         )
-        self.key_entry.pack(fill="x", padx=28, pady=(14, 6))
+        self.key_entry.pack(fill="x", padx=28, pady=(12, 4))
 
         self.status_lbl = ctk.CTkLabel(
             card, text="", font=ctk.CTkFont(size=12, weight="bold"), text_color="#f43f5e"
@@ -1722,7 +2439,7 @@ class LicenseActivationWindow(ctk.CTk):
         self.status_lbl.pack(pady=4)
 
         btn_row = ctk.CTkFrame(card, fg_color="transparent")
-        btn_row.pack(fill="x", padx=28, pady=(8, 14))
+        btn_row.pack(fill="x", padx=28, pady=(6, 8))
 
         ctk.CTkButton(
             btn_row, text="✅ KÍCH HOẠT NGAY", height=38,
@@ -1735,6 +2452,26 @@ class LicenseActivationWindow(ctk.CTk):
             fg_color="#334155", hover_color="#475569",
             command=self.destroy
         ).pack(side="right")
+
+        social_row = ctk.CTkFrame(card, fg_color="transparent")
+        social_row.pack(fill="x", padx=28, pady=(4, 12))
+
+        ctk.CTkLabel(
+            social_row, text="Liên hệ mua Key / Hỗ trợ:",
+            font=ctk.CTkFont(size=12, weight="bold"), text_color="#94a3b8"
+        ).pack(side="left")
+
+        ctk.CTkButton(
+            social_row, text="📘 Facebook", width=115, height=30,
+            fg_color="#1877F2", hover_color="#166fe5", font=ctk.CTkFont(weight="bold"),
+            command=lambda: show_social_profile_popup(self, "facebook")
+        ).pack(side="right", padx=(6, 0))
+
+        ctk.CTkButton(
+            social_row, text="💬 Discord", width=115, height=30,
+            fg_color="#5865F2", hover_color="#4752C4", font=ctk.CTkFont(weight="bold"),
+            command=lambda: show_social_profile_popup(self, "discord")
+        ).pack(side="right", padx=6)
 
     def copy_hwid(self):
         self.clipboard_clear()
