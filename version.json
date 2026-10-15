@@ -1,5 +1,5 @@
 {
   "version": "6.3",
-  "download_url": "https://github.com/ten-ban/repo/releases/download/v6.3/AntiBotnet_Pro.exe",
-  "changelog": "- Cập nhật danh sách IP C2 mới\n- Tăng tốc độ quét tiến trình"
+  "download_url": "https://github.com/chaukhaluan462-droid/Antibotnet/raw/main/AntiBotnet_Pro.exe",
+  "changelog": "- Thêm trình quét Virus Kéo & Thả File bất kỳ\n- Tối ưu hóa bộ lọc chống Botnet và C2"
 }
